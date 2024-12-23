@@ -409,17 +409,22 @@ class Collaborator:
                         creates_model=True,
                     )
                     self.tensor_db.cache_tensor({new_model_tk: nparray})
-                else:
-                    logger.info(
-                        "Count not find previous model layer."
-                        "Fetching latest layer from aggregator"
-                    )
-                    # The original model tensor should be fetched from client
-                    nparray = self.get_aggregated_tensor_from_aggregator(
-                        tensor_key, require_lossless=True
-                    )
             elif "model" in tags:
                 # Pulling the model for the first time
+                logger.info("Getting model from aggregator key %s ", tensor_key)
+                nparray = self.get_aggregated_tensor_from_aggregator(
+                    tensor_key, require_lossless=True
+                )
+            else:
+
+                # The original model tensor should be fetched from client
+                tensor_name, origin, round_number, report, tags = tensor_key
+                tags = (self.collaborator_name,) + tags
+                tensor_key = (tensor_name, origin, round_number, report, tags)
+                logger.info(
+                    f"Couldnt not find previous model layer."
+                    "Fetching latest layer from aggregator {tensor_key}"
+                )
                 nparray = self.get_aggregated_tensor_from_aggregator(
                     tensor_key, require_lossless=True
                 )

@@ -3,3 +3,4 @@
 
 
 from openfl.databases.tensor_db import TensorDB
+from openfl.databases.persistent_db import PersistentTensorDB
