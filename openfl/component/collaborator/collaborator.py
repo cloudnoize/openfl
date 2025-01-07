@@ -224,7 +224,7 @@ class Collaborator:
     def get_tasks(self):
         """Get tasks from the aggregator.
 
-        Returns:
+        Return:
              tasks (list_of_str): List of tasks.
              round_number (int): Actual round number.
              sleep_time (int): Sleep time.
