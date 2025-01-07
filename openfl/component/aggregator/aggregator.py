@@ -84,6 +84,8 @@ class Aggregator:
         log_memory_usage=False,
         write_logs=False,
         callbacks: Optional[List] = None,
+        persist_checkpoint=True,
+        persistent_db_path=None
     ):
         """Initializes the Aggregator.
 
@@ -139,8 +141,11 @@ class Aggregator:
         self.quit_job_sent_to = []
 
         self.tensor_db = TensorDB()
-        # E.L db path from configuration if exists
-        self.persistent_db = PersistentTensorDB()
+        if persist_checkpoint:
+            logger.info("Persistent checkpoint is enabled")
+            self.persistent_db = PersistentTensorDB(persistent_db_path)
+        else:
+            self.persistent_db = None
         # FIXME: I think next line generates an error on the second round
         # if it is set to 1 for the aggregator.
         self.db_store_rounds = db_store_rounds
@@ -170,8 +175,8 @@ class Aggregator:
         self.lock = Lock()
         self.use_delta_updates = use_delta_updates
 
-        if self._recover():
-            print("recovered state of aggregator")
+        if self.persistent_db and self._recover():
+            logger.info("recovered state of aggregator")
         elif initial_tensor_dict:
             self._load_initial_tensors_from_dict(initial_tensor_dict)
             self.model = utils.construct_model_proto(
@@ -201,17 +206,18 @@ class Aggregator:
     def _recover(self):
             if self.persistent_db.is_task_table_empty():
                 return False
-            # load tensor to tensor db
-            self.logger.info("Recovering previous state from persistent storage")
+            # load tensors persistent DB
+            logger.info("Recovering previous state from persistent storage")
             tensor_key_dict = self.persistent_db.load_tensors()
             if len(tensor_key_dict) > 0:
                 self.tensor_db.cache_tensor(tensor_key_dict)
-                self.logger.info("Recovery - this is the tensor_db after recovery: %s", self.tensor_db)
+                logger.debug("Recovery - this is the tensor_db after recovery: %s", self.tensor_db)
+                logger.info("Recovery - Finished populating tensor DB")
             committed_round_number, self.best_model_score = self.persistent_db.get_round_and_best_score()
             # round number is the current round which is still in process i.e. committed_round_number + 1
             self.round_number = committed_round_number + 1
-            self.logger.info("Recovery - loaded round number %s and best score %s", self.round_number,self.best_model_score)
-            self.logger.info("Recovery - Replaying saved task results")
+            logger.info("Recovery - loaded round number %s and best score %s", self.round_number,self.best_model_score)
+            logger.info("Recovery - Replaying saved task results")
             task_id = 1
             while True:
                 task_result = self.persistent_db.get_task_result_by_id(task_id)
@@ -223,10 +229,10 @@ class Aggregator:
                 data_size = task_result["data_size"]
                 serialized_tensors = task_result["named_tensors"]
                 named_tensors = [
-                    NamedTensor.FromString(tensor_string)
-                    for tensor_string in serialized_tensors
+                    NamedTensor.FromString(serialized_tensor)
+                    for serialized_tensor in serialized_tensors
                 ]
-                self.logger.info("Recovery - Replaying task results %s %s %s",collaborator_name ,round_number, task_name )
+                logger.info("Recovery - Replaying task results %s %s %s",collaborator_name ,round_number, task_name )
                 self.process_task_results(collaborator_name, round_number, task_name, data_size, named_tensors)
                 task_id += 1
 
@@ -293,7 +299,6 @@ class Aggregator:
         tensor_tuple_dict = {}
         for tk in tensor_keys:
             tk_name, _, _, _, _ = tk
-            print(f"transaction - tk is {tk} len {len(tk)} tk_name is {tk_name}")
             tensor_value = self.tensor_db.get_tensor_from_cache(tk)
             tensor_dict[tk_name] = tensor_value
             tensor_tuple_dict[tk] = tensor_value
@@ -310,11 +315,12 @@ class Aggregator:
             self.best_tensor_dict = tensor_dict
         if file_path == self.last_state_path:
             # Transaction to persist/delete all data needed to increment the round
-            self.persistent_db.finalize_round(tensor_tuple_dict,self.round_number,self.best_model_score)
-            self.logger.info(
-                    "Persist model and cleaned task result for round %s",
-                    round_number,
-                )
+            if self.persistent_db:
+                self.persistent_db.finalize_round(tensor_tuple_dict,self.round_number,self.best_model_score)
+                logger.info(
+                        "Persist model and clean task result for round %s",
+                        round_number,
+                    )
             self.last_tensor_dict = tensor_dict
         self.model = utils.construct_model_proto(
             tensor_dict, round_number, self.compression_pipeline
@@ -656,7 +662,7 @@ class Aggregator:
         """
         # Save task and its metadata for recovery
         serialized_tensors = [tensor.SerializeToString() for tensor in named_tensors]
-        self.persistent_db.save_task_results(collaborator_name,round_number,task_name,data_size,serialized_tensors)
+        self.persistent_db and self.persistent_db.save_task_results(collaborator_name,round_number,task_name,data_size,serialized_tensors)
         self.process_task_results(collaborator_name,round_number,task_name,data_size,named_tensors)
 
     def process_task_results(
@@ -1051,7 +1057,6 @@ class Aggregator:
 
         self.round_number += 1
         # resetting stragglers for task for a new round
-        #E.L should it be saved?
         self.stragglers = []
         # resetting collaborators_done for next round
         self.collaborators_done = []
@@ -1067,7 +1072,6 @@ class Aggregator:
         # Cleaning tensor db
         self.tensor_db.clean_up(self.db_store_rounds)
         # Reset straggler handling policy for the next round.
-        #E.L should it be saved?
         self.straggler_handling_policy.reset_policy_for_round()
 
     def _is_collaborator_done(self, collaborator_name: str, round_number: int) -> None:
