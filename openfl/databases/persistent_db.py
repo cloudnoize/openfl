@@ -16,14 +16,17 @@ __all__ = ['PersistentTensorDB']
 
 class PersistentTensorDB:
     """
-    The PersistentTensorDB class implements a database for storing tensors using SQLite.
+    The PersistentTensorDB class implements a database for storing tensors and metadata using SQLite.
 
     Attributes:
         conn: The SQLite connection object.
         cursor: The SQLite cursor object.
         lock: A threading Lock object used to ensure thread-safe operations.
     """
-
+    TENSORS_TABLE = "tensors"
+    NEXT_ROUND_TENSORS_TABLE = "next_round_tensors"
+    TASK_RESULT_TABLE = "task_results"
+    KEY_VALUE_TABLE = "key_value_store"
     def __init__(self, db_path: str = "") -> None:
         """Initializes a new instance of the PersistentTensorDB class."""
         full_path = "tensordb.sqlite"
@@ -31,16 +34,19 @@ class PersistentTensorDB:
             full_path = os.path.join(db_path, full_path)
         logger.info("Initializing persistent db at %s",full_path)
         self.conn = sqlite3.connect(full_path, check_same_thread=False)
-        self.cursor = self.conn.cursor()
         self.lock = Lock()
-        self._create_model_tensors_table()
-        self._create_task_results_table()
-        self._create_key_value_store()
+        
+        cursor = self.conn.cursor()
+        self._create_model_tensors_table(cursor,PersistentTensorDB.TENSORS_TABLE)
+        self._create_model_tensors_table(cursor,PersistentTensorDB.NEXT_ROUND_TENSORS_TABLE)
+        self._create_task_results_table(cursor)
+        self._create_key_value_store(cursor)
+        self.conn.commit()
 
-    def _create_model_tensors_table(self) -> None:
+    def _create_model_tensors_table(self,cursor,table_name) -> None:
         """Create the database table for storing tensors if it does not exist."""
-        self.cursor.execute("""
-            CREATE TABLE IF NOT EXISTS tensors (
+        query = f"""
+            CREATE TABLE IF NOT EXISTS {table_name} (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 tensor_name TEXT NOT NULL,
                 origin TEXT NOT NULL,
@@ -49,33 +55,33 @@ class PersistentTensorDB:
                 tags TEXT,
                 nparray BLOB NOT NULL
             )
-        """)
-        self.conn.commit()
-    
-    def _create_task_results_table(self) -> None:
-        """Creates a table for storing task results."""
-        create_table_query = """
-        CREATE TABLE IF NOT EXISTS task_results (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            collaborator_name TEXT NOT NULL,
-            round_number INTEGER NOT NULL,
-            task_name TEXT NOT NULL,
-            data_size INTEGER NOT NULL,
-            named_tensors BLOB NOT NULL
-        );
         """
-        self.cursor.execute(create_table_query)
-        self.conn.commit()
+        cursor.execute(query)
     
-    def _create_key_value_store(self) -> None:
+    
+    def _create_task_results_table(self,cursor) -> None:
+        """Creates a table for storing task results."""
+        query = f"""
+            CREATE TABLE IF NOT EXISTS {PersistentTensorDB.TASK_RESULT_TABLE} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                collaborator_name TEXT NOT NULL,
+                round_number INTEGER NOT NULL,
+                task_name TEXT NOT NULL,
+                data_size INTEGER NOT NULL,
+                named_tensors BLOB NOT NULL
+            )
+        """
+        cursor.execute(query)
+    
+    def _create_key_value_store(self,cursor) -> None:
         """Create a key-value store table for storing additional metadata."""
-        self.cursor.execute("""
-            CREATE TABLE IF NOT EXISTS key_value_store (
+        query = f"""
+            CREATE TABLE IF NOT EXISTS {PersistentTensorDB.KEY_VALUE_TABLE} (
                 key TEXT PRIMARY KEY,
                 value REAL NOT NULL
             )
-        """)
-        self.conn.commit()
+        """
+        cursor.execute(query)
 
     def save_task_results(
         self,
@@ -99,16 +105,18 @@ class PersistentTensorDB:
 
 
         # Insert into the database
-        insert_query = """
-        INSERT INTO task_results 
+        insert_query = f"""
+        INSERT INTO {PersistentTensorDB.TASK_RESULT_TABLE} 
         (collaborator_name, round_number, task_name, data_size, named_tensors)
         VALUES (?, ?, ?, ?, ?);
         """
-        self.cursor.execute(
-            insert_query,
-            (collaborator_name, round_number, task_name, data_size, serialized_blob),
-        )
-        self.conn.commit()
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                insert_query,
+                (collaborator_name, round_number, task_name, data_size, serialized_blob),
+            )
+            self.conn.commit()
 
     def get_task_result_by_id(self, task_result_id: int):
         """
@@ -121,12 +129,14 @@ class PersistentTensorDB:
             A dictionary containing the task result details, or None if not found.
         """
         with self.lock:
-            self.cursor.execute("""
+            cursor = self.conn.cursor()
+            query = f"""
                 SELECT collaborator_name, round_number, task_name, data_size, named_tensors
-                FROM task_results
+                FROM {PersistentTensorDB.TASK_RESULT_TABLE}
                 WHERE id = ?
-            """, (task_result_id,))
-            result = self.cursor.fetchone()
+            """
+            cursor.execute(query, (task_result_id,))
+            result = cursor.fetchone()
             if result:
                 collaborator_name, round_number, task_name, data_size, serialized_blob = result
                 serialized_tensors = pickle.loads(serialized_blob)
@@ -140,89 +150,126 @@ class PersistentTensorDB:
             return None
 
     def _serialize_array(self, array: np.ndarray) -> bytes:
-        """Serialize a NumPy array into bytes for storing in SQLite."""
-        return array.tobytes()
+        """Serialize a NumPy array into bytes for storing in SQLite.
+           note: using pickle since in some cases the array is actually a scalar.
+        """
+        return pickle.dumps(array)
 
     def _deserialize_array(self, blob: bytes, dtype: Optional[np.dtype] = None) -> np.ndarray:
         """Deserialize bytes from SQLite into a NumPy array."""
-        return np.frombuffer(blob, dtype=dtype)
+        try:
+            return pickle.loads(blob)
+        except Exception as e:
+            raise ValueError(f"Failed to deserialize array: {e}")
 
     def __repr__(self) -> str:
         """Returns a string representation of the PersistentTensorDB."""
         with self.lock:
-            self.cursor.execute("SELECT tensor_name, origin, round, report, tags FROM tensors")
-            rows = self.cursor.fetchall()
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT tensor_name, origin, round, report, tags FROM tensors")
+            rows = cursor.fetchall()
             return f"PersistentTensorDB contents:\n{rows}"
 
-    def finalize_round(self,tensor_key_dict: Dict[TensorKey, np.ndarray],round_number: int, best_score: float):
+    def finalize_round(self,tensor_key_dict: Dict[TensorKey, np.ndarray],next_round_tensor_key_dict: Dict[TensorKey, np.ndarray],round_number: int, best_score: float):
+        """Finalize a training round by saving tensors, preparing for the next round, 
+        and updating metadata in the database.
+
+        This function performs the following steps as a single transaction:
+        1. Persist the tensors of the current round into the database.
+        2. Persist the tensors for the next training round into the database.
+        3. Reinitialize the task results table to prepare for new tasks.
+        4. Update the round number and best score in the key-value store.
+
+        If any step fails, the transaction is rolled back to ensure data integrity.
+
+        Args:
+            tensor_key_dict (Dict[TensorKey, np.ndarray]): 
+                A dictionary mapping tensor keys to their corresponding NumPy arrays for the current round.
+            next_round_tensor_key_dict (Dict[TensorKey, np.ndarray]): 
+                A dictionary mapping tensor keys to their corresponding NumPy arrays for the next round.
+            round_number (int): 
+                The current training round number.
+            best_score (float): 
+                The best score achieved during the current round.
+
+        Raises:
+            RuntimeError: If an error occurs during the transaction, the transaction is rolled back, 
+                        and a RuntimeError is raised with the details of the failure.
+        """
         with self.lock:
             try:
                 # Begin transaction
-                self.cursor.execute("BEGIN TRANSACTION")
-                self._persist_tensors(tensor_key_dict)
-                self._init_task_results_table()
-                self._save_round_and_best_score(round_number,best_score)
+                cursor = self.conn.cursor()
+                cursor.execute("BEGIN TRANSACTION")
+                self._persist_tensors(cursor,PersistentTensorDB.TENSORS_TABLE,tensor_key_dict)
+                self._persist_next_round_tensors(cursor,next_round_tensor_key_dict)
+                self._init_task_results_table(cursor)
+                self._save_round_and_best_score(cursor,round_number,best_score)
                 # Commit transaction
                 self.conn.commit()
-                logger.info(f"Committed model for round {round_number}, saved {len(tensor_key_dict)} model tensors with best_score {best_score}")
+                logger.info(f"Committed model for round {round_number}, saved {len(tensor_key_dict)} model tensors and {len(next_round_tensor_key_dict)} next round model tensors  with best_score {best_score}")
             except Exception as e:
                 # Rollback transaction in case of an error
                 self.conn.rollback()
                 raise RuntimeError(f"Failed to finalize round: {e}")
             
-    def _persist_tensors(self, tensor_key_dict: Dict[TensorKey, np.ndarray]) -> None:
-        """Insert a dictionary of tensors into the SQLite database in a single transaction."""
+    def _persist_tensors(self,cursor,table_name, tensor_key_dict: Dict[TensorKey, np.ndarray]) -> None:
+        """Insert a dictionary of tensors into the SQLite as part of transaction"""
         for tensor_key, nparray in tensor_key_dict.items():
             tensor_name, origin, fl_round, report, tags = tensor_key
             serialized_array = self._serialize_array(nparray)
             serialized_tags = json.dumps(tags) 
-            self.cursor.execute("""
-                INSERT INTO tensors (tensor_name, origin, round, report, tags, nparray)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (tensor_name, origin, fl_round, int(report), serialized_tags, serialized_array))
+            query = f"""
+                    INSERT INTO {table_name} (tensor_name, origin, round, report, tags, nparray)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """
+            cursor.execute(query, (tensor_name, origin, fl_round, int(report), serialized_tags, serialized_array))
     
-    def _init_task_results_table(self):
+    def _persist_next_round_tensors(self,cursor, tensor_key_dict: Dict[TensorKey, np.ndarray]) -> None:
+        """Persisting the last round next_round tensors."""
+        drop_table_query = f"DROP TABLE IF EXISTS {PersistentTensorDB.NEXT_ROUND_TENSORS_TABLE}"
+        cursor.execute(drop_table_query)
+        self._create_model_tensors_table(cursor,PersistentTensorDB.NEXT_ROUND_TENSORS_TABLE)
+        self._persist_tensors(cursor,PersistentTensorDB.NEXT_ROUND_TENSORS_TABLE,tensor_key_dict)
+
+    
+    def _init_task_results_table(self,cursor):
         """
         Creates a table for storing task results. Drops the table first if it already exists.
         """
         drop_table_query = "DROP TABLE IF EXISTS task_results"
-        self.cursor.execute(drop_table_query)
-        
-        create_table_query = """
-        CREATE TABLE IF NOT EXISTS task_results (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            collaborator_name TEXT NOT NULL,
-            round_number INTEGER NOT NULL,
-            task_name TEXT NOT NULL,
-            data_size INTEGER NOT NULL,
-            named_tensors BLOB NOT NULL
-        );
-        """
-        self.cursor.execute(create_table_query)
+        cursor.execute(drop_table_query)
+        self._create_task_results_table(cursor)
     
-    def _save_round_and_best_score(self, round_number: int, best_score: float) -> None:
+    def _save_round_and_best_score(self,cursor, round_number: int, best_score: float) -> None:
         """Save the round number and best score as key-value pairs in the database."""
         # Create a table with key-value structure where values can be integer or float
         # Insert or update the round_number
-        self.cursor.execute("""
+        cursor.execute("""
             INSERT OR REPLACE INTO key_value_store (key, value)
             VALUES (?, ?)
         """, ("round_number", float(round_number)))
 
         # Insert or update the best_score
-        self.cursor.execute("""
+        cursor.execute("""
             INSERT OR REPLACE INTO key_value_store (key, value)
             VALUES (?, ?)
         """, ("best_score", float(best_score)))
 
+    def get_tensors_table_name(self) -> str:
+        return PersistentTensorDB.TENSORS_TABLE
     
+    def get_next_round_tensors_table_name(self) -> str:
+        return PersistentTensorDB.NEXT_ROUND_TENSORS_TABLE
 
-    def load_tensors(self) -> Dict[TensorKey, np.ndarray]:
+    def load_tensors(self,tensor_table) -> Dict[TensorKey, np.ndarray]:
         """Load all tensors from the SQLite database and return them as a dictionary."""
         tensor_dict = {}
         with self.lock:
-            self.cursor.execute("SELECT tensor_name, origin, round, report, tags, nparray FROM tensors")
-            rows = self.cursor.fetchall()
+            cursor = self.conn.cursor() 
+            query = f"SELECT tensor_name, origin, round, report, tags, nparray FROM {tensor_table}"
+            cursor.execute(query)
+            rows = cursor.fetchall()
             for row in rows:
                 tensor_name, origin, fl_round, report, tags, nparray = row
                 # Deserialize the JSON string back to a Python list
@@ -235,21 +282,22 @@ class PersistentTensorDB:
     def get_round_and_best_score(self) -> tuple[int, float]:
         """Retrieve the round number and best score from the database."""
         with self.lock:
+            cursor = self.conn.cursor() 
             # Fetch the round_number
-            self.cursor.execute("""
+            cursor.execute("""
                 SELECT value FROM key_value_store WHERE key = ?
             """, ("round_number",))
-            round_number = self.cursor.fetchone()
+            round_number = cursor.fetchone()
             if round_number is None:
                 round_number = -1
             else:
                 round_number = int(round_number[0])  # Cast to int
 
             # Fetch the best_score
-            self.cursor.execute("""
+            cursor.execute("""
                 SELECT value FROM key_value_store WHERE key = ?
             """, ("best_score",))
-            best_score = self.cursor.fetchone()
+            best_score = cursor.fetchone()
             if best_score is None:
                 best_score = 0
             else:
@@ -262,11 +310,13 @@ class PersistentTensorDB:
         if remove_older_than < 0:
             return
         with self.lock:
-            self.cursor.execute("SELECT MAX(round) FROM tensors")
-            current_round = self.cursor.fetchone()[0]
+            cursor = self.conn.cursor()
+            query = f"SELECT MAX(round) FROM {PersistentTensorDB.TENSORS_TABLE}"
+            cursor.execute(query)
+            current_round = cursor.fetchone()[0]
             if current_round is None:
                 return
-            self.cursor.execute("""
+            cursor.execute("""
                 DELETE FROM tensors
                 WHERE round <= ? AND report = 0
             """, (current_round - remove_older_than,))
@@ -280,6 +330,7 @@ class PersistentTensorDB:
     def is_task_table_empty(self) -> bool:
         """Check if the task table is empty."""
         with self.lock:
-            self.cursor.execute("SELECT COUNT(*) FROM task_results")
-            count = self.cursor.fetchone()[0]
+            cursor = self.conn.cursor() 
+            cursor.execute("SELECT COUNT(*) FROM task_results")
+            count = cursor.fetchone()[0]
             return count == 0
