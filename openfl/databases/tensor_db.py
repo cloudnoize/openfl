@@ -150,7 +150,7 @@ class TensorDB:
         if len(df) == 0:
             return None
         return np.array(df["nparray"].iloc[0])
-    
+
     def get_tensors_by_round_and_tags(self, fl_round: int, tags: tuple) -> dict:
         """Retrieve all tensors that match the specified round and tags.
 
@@ -163,8 +163,7 @@ class TensorDB:
         """
         # Filter the DataFrame based on the round and tags
         df = self.tensor_db[
-            (self.tensor_db["round"] == fl_round) &
-            (self.tensor_db["tags"] == tags)
+            (self.tensor_db["round"] == fl_round) & (self.tensor_db["tags"] == tags)
         ]
 
         # Check if any tensors match the criteria
@@ -179,12 +178,11 @@ class TensorDB:
                 origin=row["origin"],
                 round_number=row["round"],
                 report=row["report"],
-                tags=row["tags"]
+                tags=row["tags"],
             )
             tensor_dict[tensor_key] = np.array(row["nparray"])
 
         return tensor_dict
-
 
     def get_aggregated_tensor(
         self,
