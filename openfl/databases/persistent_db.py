@@ -346,7 +346,7 @@ class PersistentTensorDB:
             cursor.execute(
                 """
                 DELETE FROM tensors
-                WHERE round <= ? AND report = 0
+                WHERE round < ? AND report = 0
             """,
                 (current_round - remove_older_than,),
             )
