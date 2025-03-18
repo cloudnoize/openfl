@@ -365,6 +365,13 @@ class Aggregator:
             TensorKey(k, self.uuid, round_number, False, ("model",))
             for k, v in og_tensor_dict.items()
         ]
+        # Log the number of keys
+        logging.info(f"LOGZ Number of tensor keys: {len(tensor_keys)} round number {round_number}")
+
+        # Log each key in the list
+        for key in tensor_keys:
+            logging.info(f"Tensor Key: {key}")
+
         tensor_dict = {}
         tensor_tuple_dict = {}
         next_round_tensors = {}
@@ -1048,6 +1055,7 @@ class Aggregator:
         )
         self.next_model_round_number = new_model_round_number
         # Finally, cache the updated model tensor
+        logger.info(f"LOGZ - prepare tained final_model_tk {final_model_tk} self.next_model_round_number {self.next_model_round_number}")
         self.tensor_db.cache_tensor({final_model_tk: new_model_nparray})
 
     def _compute_validation_related_task_metrics(self, task_name) -> dict:
